@@ -629,6 +629,7 @@ pub(crate) struct CodexToolItemEventBase {
     pub(crate) thread_id: String,
     pub(crate) session_id: String,
     pub(crate) turn_id: String,
+    pub(crate) root_turn_id: Option<String>,
     /// App-server ThreadItem.id. For tool-originated items this generally
     /// corresponds to the originating core call_id.
     pub(crate) item_id: String,
@@ -1004,6 +1005,7 @@ pub(crate) struct CodexTurnEventParams {
     pub(crate) thread_id: String,
     pub(crate) session_id: String,
     pub(crate) turn_id: String,
+    pub(crate) root_turn_id: Option<String>,
     // TODO(rhan-oai): Populate once queued/default submission type is plumbed from
     // the turn/start callsites instead of always being reported as None.
     pub(crate) submission_type: Option<TurnSubmissionType>,
@@ -1449,7 +1451,7 @@ pub(crate) fn subagent_thread_started_event_request(
         runtime: current_runtime_metadata(),
         model: input.model,
         ephemeral: input.ephemeral,
-        thread_source: Some(ThreadSource::Subagent),
+        thread_source: input.thread_source,
         initialization_mode: ThreadInitializationMode::New,
         subagent_source: Some(subagent_source_name(&input.subagent_source)),
         parent_thread_id: input.parent_thread_id,

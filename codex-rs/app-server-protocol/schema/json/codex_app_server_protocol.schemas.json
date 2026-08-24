@@ -7510,6 +7510,13 @@
               "bedrockApiKey"
             ],
             "type": "string"
+          },
+          {
+            "description": "Amazon Bedrock AWS access keys managed by Codex.",
+            "enum": [
+              "bedrockAccessKeys"
+            ],
+            "type": "string"
           }
         ]
       },
@@ -13357,6 +13364,41 @@
             ],
             "title": "AmazonBedrockv2::LoginAccountParams",
             "type": "object"
+          },
+          {
+            "description": "[UNSTABLE] Managed Amazon Bedrock AWS access key login is experimental.",
+            "properties": {
+              "accessKeyId": {
+                "type": "string"
+              },
+              "region": {
+                "type": "string"
+              },
+              "secretAccessKey": {
+                "type": "string"
+              },
+              "sessionToken": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "enum": [
+                  "amazonBedrockAccessKeys"
+                ],
+                "title": "AmazonBedrockAccessKeysv2::LoginAccountParamsType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "accessKeyId",
+              "region",
+              "secretAccessKey",
+              "type"
+            ],
+            "title": "AmazonBedrockAccessKeysv2::LoginAccountParams",
+            "type": "object"
           }
         ],
         "title": "LoginAccountParams"
@@ -13816,6 +13858,18 @@
         "title": "McpResourceReadResponse",
         "type": "object"
       },
+      "McpServerConnectionStatus": {
+        "enum": [
+          "notStarted",
+          "starting",
+          "connected",
+          "authenticationRequired",
+          "failed",
+          "cancelled",
+          "disabled"
+        ],
+        "type": "string"
+      },
       "McpServerEventNotification": {
         "properties": {
           "method": {
@@ -14039,6 +14093,17 @@
               "$ref": "#/definitions/v2/Resource"
             },
             "type": "array"
+          },
+          "runtimeStatus": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/McpServerConnectionStatus"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Current thread-runtime connection state; null when unavailable or the configuration changed."
           },
           "serverInfo": {
             "anyOf": [
@@ -19343,7 +19408,8 @@
         "enum": [
           "started",
           "interacted",
-          "interrupted"
+          "interrupted",
+          "completed"
         ],
         "type": "string"
       },
