@@ -9,6 +9,8 @@ impl ChatWidget {
         display: SessionConfiguredDisplay,
         fork_parent_title: Option<String>,
     ) {
+        self.invalidate_permission_discovery();
+        self.permission_profiles_menu_opened = false;
         self.transcript.reset_copy_history();
         let history_metadata = session.message_history.unwrap_or_default();
         self.bottom_pane.set_history_metadata(
@@ -25,6 +27,9 @@ impl ChatWidget {
         self.bottom_pane
             .set_queue_submissions(/*queue_submissions*/ false);
         if previous_thread_id != self.thread_id {
+            self.backend_banner_notice_model = None;
+            self.automatic_model_switch_state =
+                backend_banners::AutomaticModelSwitchState::default();
             self.review.recent_auto_review_denials = RecentAutoReviewDenials::default();
             self.clear_thread_usage_state();
         }
@@ -112,6 +117,19 @@ impl ChatWidget {
             .set_active_reasoning_effort_baseline(effort.as_ref());
         self.refresh_model_display();
         self.refresh_status_surfaces();
+        if previous_thread_id != self.thread_id
+            && self.should_prefetch_rate_limits()
+            && (self.current_model() == crate::model_catalog::LUNA_RESERVE_MODEL
+                || self.backend_banner_fallback().is_some())
+        {
+            // Reconcile this task with retained account state before sending its initial/queued
+            // prompt. Do not wait for the next usage poll after /new, /resume or a thread switch.
+            self.hold_rate_limit_recovery();
+            self.app_event_tx
+                .send(AppEvent::ApplyBackendBannerFallback {
+                    thread_id: session.thread_id,
+                });
+        }
         self.sync_service_tier_commands();
         self.sync_personality_command_enabled();
         self.sync_plugins_command_enabled();
@@ -127,6 +145,7 @@ impl ChatWidget {
                 .should_show_fast_status(&model_for_header, self.effective_service_tier.as_deref());
             let session_info_cell = history_cell::new_session_info(
                 &self.config,
+                &self.local_settings,
                 &model_for_header,
                 &session,
                 self.show_welcome_banner,
@@ -245,16 +264,22 @@ impl ChatWidget {
         )));
     }
 
-    pub(super) fn on_thread_name_updated(
+    /// Update status surfaces before a confirmed manual rename's server notification arrives.
+    pub(crate) fn expect_manual_thread_name(&mut self, thread_id: ThreadId, name: String) {
+        if self.thread_id == Some(thread_id) {
+            self.thread_name = Some(name);
+            self.refresh_status_surfaces();
+            self.request_redraw();
+        }
+    }
+
+    /// Update name metadata silently, including late and replayed notifications.
+    pub(crate) fn on_thread_name_updated(
         &mut self,
         thread_id: ThreadId,
         thread_name: Option<String>,
     ) {
         if self.thread_id == Some(thread_id) {
-            if let Some(name) = thread_name.as_deref() {
-                let cell = Self::rename_confirmation_cell(name, self.thread_id);
-                self.add_boxed_history(Box::new(cell));
-            }
             self.thread_name = thread_name;
             self.refresh_status_surfaces();
             self.request_redraw();

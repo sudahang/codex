@@ -17,6 +17,8 @@ use codex_network_proxy::NetworkPolicyDecider;
 use codex_network_proxy::NetworkPolicyRequest;
 use codex_network_proxy::NetworkProtocol;
 use codex_network_proxy::NetworkProxy;
+use codex_network_proxy::NetworkRequestCancellation;
+use codex_network_proxy::NetworkRequestCancellationReason;
 use codex_network_proxy::NetworkRequestDisconnect;
 use codex_protocol::approvals::NetworkApprovalContext;
 use codex_protocol::approvals::NetworkApprovalProtocol;
@@ -280,6 +282,7 @@ struct PendingHostApprovalOwner<'a> {
     pending: Arc<PendingHostApproval>,
     execution_cancellation: Option<CancellationToken>,
     disconnect: Option<NetworkRequestDisconnect>,
+    cancellation: Option<NetworkRequestCancellation>,
     decision_on_drop: PendingApprovalDecision,
     completed: bool,
 }
@@ -297,6 +300,7 @@ impl<'a> PendingHostApprovalOwner<'a> {
             pending,
             execution_cancellation,
             disconnect: None,
+            cancellation: None,
             decision_on_drop: PendingApprovalDecision::Deny,
             completed: false,
         }
@@ -342,6 +346,17 @@ impl<'a> PendingHostApprovalOwner<'a> {
 impl Drop for PendingHostApprovalOwner<'_> {
     fn drop(&mut self) {
         if !self.completed {
+            if self
+                .cancellation
+                .as_ref()
+                .and_then(NetworkRequestCancellation::reason)
+                == Some(NetworkRequestCancellationReason::ProcessFinished)
+            {
+                // Normal process cleanup is not a new review failure. Any earlier
+                // denial is already recorded in the call outcome.
+                self.publish_and_remove(self.decision_on_drop);
+                return;
+            }
             if matches!(self.decision_on_drop, PendingApprovalDecision::Deny)
                 && let Some(registration_id) = self.key.execution_id.as_deref()
                 && let Some(elapsed) = self
@@ -517,20 +532,27 @@ impl NetworkApprovalService {
     }
 
     fn record_call_outcome(&self, registration_id: &str, outcome: String) {
+        if let Some(cancellation_token) = self.store_call_outcome(registration_id, outcome) {
+            cancellation_token.cancel();
+        }
+    }
+
+    fn store_call_outcome(
+        &self,
+        registration_id: &str,
+        outcome: String,
+    ) -> Option<CancellationToken> {
         let mut calls = self
             .calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(call) = calls.active_calls.get(registration_id).cloned() else {
-            return;
-        };
+        let call = calls.active_calls.get(registration_id)?.clone();
         // Explicit network-review outcomes replace generic blocked-request fallbacks.
         calls
             .call_outcomes
             .insert(registration_id.to_string(), outcome);
 
-        drop(calls);
-        call.cancellation_token.cancel();
+        Some(call.cancellation_token.clone())
     }
 
     fn record_call_outcome_if_absent(&self, registration_id: &str, outcome: String) {
@@ -621,7 +643,7 @@ impl NetworkApprovalService {
         let Some(environment_id) = active_environment_id.or_else(|| {
             active_turn
                 .as_ref()
-                .and_then(|(turn_context, _)| turn_context.environments.primary())
+                .and_then(|(turn_context, _, _)| turn_context.environments.primary())
                 .map(|environment| environment.selection.environment_id.clone())
         }) else {
             return NetworkDecision::deny(REASON_NOT_ALLOWED);
@@ -648,7 +670,7 @@ impl NetworkApprovalService {
             format!("Network access to \"{target}\" was blocked by policy.");
         let prompt_reason = format!("{} is not in the allowed_domains", request.host);
 
-        let Some((turn_context, strict_auto_review)) = active_turn else {
+        let Some((turn_context, step_settings, strict_auto_review)) = active_turn else {
             if let Some(owner_call) = owner_call.as_ref() {
                 self.record_call_outcome(&owner_call.registration_id, policy_denial_message);
             }
@@ -676,6 +698,7 @@ impl NetworkApprovalService {
                 .map(|call| call.cancellation_token.clone()),
         );
         pending_owner.disconnect = request.disconnect.clone();
+        pending_owner.cancellation = request.cancellation.clone();
 
         let permission_profile = owner_call
             .as_ref()
@@ -694,7 +717,11 @@ impl NetworkApprovalService {
             pending_owner.complete(PendingApprovalDecision::Deny);
             return NetworkDecision::deny(REASON_NOT_ALLOWED);
         }
-        if !allows_network_approval_flow(turn_context.approval_policy()) {
+        let review_context = GuardianReviewContext::from_resolved_settings(
+            Arc::clone(&turn_context),
+            &step_settings,
+        );
+        if !allows_network_approval_flow(review_context.approval_policy) {
             if let Some(owner_call) = owner_call.as_ref() {
                 self.record_call_outcome(&owner_call.registration_id, policy_denial_message);
             }
@@ -755,7 +782,7 @@ impl NetworkApprovalService {
             cwd,
         };
         let approval_context = ApprovalContext {
-            review_context: GuardianReviewContext::from(&turn_context),
+            review_context,
             cancellation_token: None,
             call_id: approval_call_id,
             tool_name: telemetry_tool_name.clone(),
@@ -809,6 +836,18 @@ impl NetworkApprovalService {
                 return NetworkDecision::deny(REASON_NOT_ALLOWED);
             }
         };
+
+        if matches!(
+            &approval_decision,
+            ReviewDecision::NetworkPolicyAmendment { network_policy_amendment }
+                if network_policy_amendment.action == NetworkPolicyRuleAction::Deny
+        ) && let Some(owner_call) = owner_call.as_ref()
+        {
+            // Preserve the denial before waiting for the policy commit. Defer
+            // cancellation until after saving so it cannot interrupt persistence.
+            let _ = self
+                .store_call_outcome(&owner_call.registration_id, "rejected by user".to_string());
+        }
 
         let _session_policy_commit_guard = if matches!(
             &approval_decision,

@@ -272,6 +272,8 @@ impl BundleClient for NotifyingPendingBundleClient {
 struct SequenceBundleClient {
     responses: tokio::sync::Mutex<VecDeque<Result<CloudConfigBundle, BundleRequestError>>>,
     request_count: AtomicUsize,
+    request_started: tokio::sync::Notify,
+    timeout_attempts: usize,
 }
 
 impl SequenceBundleClient {
@@ -279,13 +281,19 @@ impl SequenceBundleClient {
         Self {
             responses: tokio::sync::Mutex::new(VecDeque::from(responses)),
             request_count: AtomicUsize::new(0),
+            request_started: tokio::sync::Notify::new(),
+            timeout_attempts: 0,
         }
     }
 }
 
 impl BundleClient for SequenceBundleClient {
     async fn get_bundle(&self, _auth: &CodexAuth) -> Result<CloudConfigBundle, BundleRequestError> {
-        self.request_count.fetch_add(1, Ordering::SeqCst);
+        let attempt = self.request_count.fetch_add(1, Ordering::SeqCst);
+        self.request_started.notify_one();
+        if attempt < self.timeout_attempts {
+            pending::<()>().await;
+        }
         let mut responses = self.responses.lock().await;
         responses
             .pop_front()
@@ -624,6 +632,74 @@ async fn get_bundle_uses_cache_when_valid() {
 
     assert_eq!(service.load_startup_bundle().await, Ok(Some(bundle)));
     assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn get_bundle_without_cache_ignores_and_preserves_valid_cache() {
+    let codex_home = tempdir().expect("tempdir");
+    let cache = create_test_cache(codex_home.path());
+    cache
+        .save(
+            Some("user-12345".to_string()),
+            Some("account-12345".to_string()),
+            CloudConfigBundle::default(),
+        )
+        .await
+        .expect("write empty cache");
+    let cached_bytes = std::fs::read(cache.path()).expect("read cache");
+    let bundle = test_bundle();
+    let fetcher = Arc::new(StaticBundleClient::new(bundle.clone()));
+    let service = CloudConfigBundleService::new(
+        auth_manager_with_plan("business").await,
+        fetcher.clone(),
+        codex_home.path().to_path_buf(),
+        CLOUD_CONFIG_BUNDLE_TIMEOUT,
+    )
+    .without_cache();
+
+    assert_eq!(
+        service.load_startup_bundle_with_timeout().await,
+        Ok(Some(bundle))
+    );
+    assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        std::fs::read(cache.path()).expect("read unchanged cache"),
+        cached_bytes
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn get_bundle_without_cache_fails_closed_on_request_failure() {
+    let codex_home = tempdir().expect("tempdir");
+    create_test_cache(codex_home.path())
+        .save(
+            Some("user-12345".to_string()),
+            Some("account-12345".to_string()),
+            test_bundle(),
+        )
+        .await
+        .expect("write valid cache");
+    let fetcher = Arc::new(SequenceBundleClient::new(vec![
+        Err(request_error());
+        CLOUD_CONFIG_BUNDLE_MAX_ATTEMPTS
+    ]));
+    let service = CloudConfigBundleService::new(
+        auth_manager_with_plan("business").await,
+        fetcher.clone(),
+        codex_home.path().to_path_buf(),
+        CLOUD_CONFIG_BUNDLE_TIMEOUT,
+    )
+    .without_cache();
+
+    let err = service
+        .load_startup_bundle_with_timeout()
+        .await
+        .expect_err("request failure must not fall back to the cache");
+    assert_eq!(err.code(), CloudConfigBundleLoadErrorCode::RequestFailed);
+    assert_eq!(
+        fetcher.request_count.load(Ordering::SeqCst),
+        CLOUD_CONFIG_BUNDLE_MAX_ATTEMPTS
+    );
 }
 
 #[tokio::test]
@@ -1065,6 +1141,147 @@ async fn refresh_from_remote_updates_cached_bundle() {
         .await
         .expect("load cache");
     assert_eq!(signed_payload.bundle, replacement_bundle);
+}
+
+#[tokio::test(start_paused = true)]
+async fn production_loader_recovers_startup_timeouts_in_background() {
+    let codex_home = tempdir().expect("tempdir");
+    let fetcher = Arc::new(SequenceBundleClient {
+        timeout_attempts: 2,
+        ..SequenceBundleClient::new(vec![Ok(test_bundle())])
+    });
+    let service = CloudConfigBundleService::new(
+        auth_manager_with_plan("business").await,
+        Arc::clone(&fetcher),
+        codex_home.path().to_path_buf(),
+        CLOUD_CONFIG_BUNDLE_TIMEOUT,
+    );
+    let (loader, _) = crate::bundle_loader::cloud_config_bundle_loader_for_service(service);
+    let (initial, ()) = tokio::join!(loader.get(), async {
+        fetcher.request_started.notified().await;
+        tokio::time::advance(CLOUD_CONFIG_BUNDLE_TIMEOUT + Duration::from_millis(1)).await;
+    });
+    assert_eq!(
+        initial
+            .as_ref()
+            .expect_err("startup should time out")
+            .code(),
+        CloudConfigBundleLoadErrorCode::Timeout
+    );
+    assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
+
+    for attempt in 2..=3 {
+        tokio::time::timeout(
+            CLOUD_CONFIG_BUNDLE_TIMEOUT_RETRY_INTERVAL + Duration::from_millis(1),
+            fetcher.request_started.notified(),
+        )
+        .await
+        .expect("the worker should retry before the normal refresh interval");
+        assert_eq!(fetcher.request_count.load(Ordering::SeqCst), attempt);
+        if attempt == 2 {
+            // Readers keep returning the snapshot while the worker's retry is pending.
+            let (first, second) = tokio::join!(loader.get(), loader.get());
+            assert_eq!((first, second), (initial.clone(), initial.clone()));
+            assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 2);
+            tokio::time::advance(CLOUD_CONFIG_BUNDLE_TIMEOUT + Duration::from_millis(1)).await;
+        }
+    }
+
+    let recovery_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while loader.get().await != Ok(Some(test_bundle())) {
+        assert!(
+            std::time::Instant::now() < recovery_deadline,
+            "the worker should publish the recovered bundle"
+        );
+        tokio::task::yield_now().await;
+    }
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .cloud_config_bundle(loader.clone())
+        .build()
+        .await
+        .expect("later configuration loads should apply the recovered bundle");
+    assert_eq!(config.model.as_deref(), Some("gpt-5"));
+    assert_eq!(
+        config.permissions.approval_policy.value(),
+        codex_protocol::protocol::AskForApproval::Never
+    );
+
+    tokio::time::timeout(
+        CLOUD_CONFIG_BUNDLE_TIMEOUT_RETRY_INTERVAL + Duration::from_millis(1),
+        fetcher.request_started.notified(),
+    )
+    .await
+    .expect_err("successful recovery should restore the normal refresh interval");
+    tokio::time::timeout(
+        CLOUD_CONFIG_BUNDLE_CACHE_REFRESH_INTERVAL,
+        fetcher.request_started.notified(),
+    )
+    .await
+    .expect("normal background refresh should continue after recovery");
+    assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn production_loader_restores_normal_refresh_interval_after_non_timeout_error() {
+    let codex_home = tempdir().expect("tempdir");
+    let fetcher = Arc::new(SequenceBundleClient {
+        timeout_attempts: 1,
+        ..SequenceBundleClient::new(vec![Ok(invalid_config_bundle()), Ok(test_bundle())])
+    });
+    let service = CloudConfigBundleService::new(
+        auth_manager_with_plan("business").await,
+        Arc::clone(&fetcher),
+        codex_home.path().to_path_buf(),
+        CLOUD_CONFIG_BUNDLE_TIMEOUT,
+    );
+    let (loader, _) = crate::bundle_loader::cloud_config_bundle_loader_for_service(service);
+    let (initial, ()) = tokio::join!(loader.get(), async {
+        fetcher.request_started.notified().await;
+        tokio::time::advance(CLOUD_CONFIG_BUNDLE_TIMEOUT + Duration::from_millis(1)).await;
+    });
+    assert_eq!(
+        initial.expect_err("startup should time out").code(),
+        CloudConfigBundleLoadErrorCode::Timeout
+    );
+    assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
+
+    tokio::time::timeout(
+        CLOUD_CONFIG_BUNDLE_TIMEOUT_RETRY_INTERVAL + Duration::from_millis(1),
+        fetcher.request_started.notified(),
+    )
+    .await
+    .expect("the worker should retry the startup timeout promptly");
+    let refresh_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let error = loader
+            .get()
+            .await
+            .expect_err("the invalid bundle should fail closed");
+        if error.code() == CloudConfigBundleLoadErrorCode::InvalidBundle {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < refresh_deadline,
+            "the retry should replace the cached timeout with the validation error"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 2);
+
+    tokio::time::timeout(
+        CLOUD_CONFIG_BUNDLE_CACHE_REFRESH_INTERVAL - Duration::from_secs(1),
+        fetcher.request_started.notified(),
+    )
+    .await
+    .expect_err("the non-timeout error should stop fast retries");
+    tokio::time::timeout(
+        Duration::from_secs(1) + Duration::from_millis(1),
+        fetcher.request_started.notified(),
+    )
+    .await
+    .expect("refresh should resume at the normal interval");
+    assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test(start_paused = true)]

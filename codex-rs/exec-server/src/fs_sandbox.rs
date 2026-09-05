@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(any(windows, test))]
+use std::time::Duration;
 
 use codex_exec_server_protocol::JSONRPCErrorError;
 use codex_protocol::models::PermissionProfile;
@@ -16,8 +18,13 @@ use codex_sandboxing::SandboxTransformRequest;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
 use codex_utils_absolute_path::AbsolutePathBuf;
+#[cfg(not(target_os = "linux"))]
 use codex_utils_absolute_path::canonicalize_preserving_symlinks;
 use codex_utils_path_uri::PathUri;
+#[cfg(any(windows, test))]
+use tokio::io::AsyncBufReadExt;
+#[cfg(any(windows, test))]
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
@@ -32,6 +39,10 @@ use crate::rpc::internal_error;
 use crate::rpc::invalid_request;
 
 const FS_HELPER_ENV_ALLOWLIST: &[&str] = &["PATH", "TMPDIR", "TMP", "TEMP"];
+#[cfg(any(windows, test))]
+const FS_HELPER_EXIT_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 2);
+#[cfg(any(windows, test))]
+const MAX_FS_HELPER_STDERR_BYTES: u64 = 4096;
 #[cfg(debug_assertions)]
 const FS_HELPER_BAZEL_BWRAP_ENV_ALLOWLIST: &[&str] = &[
     "CARGO_BIN_EXE_bwrap",
@@ -100,6 +111,9 @@ impl FileSystemSandboxRunner {
             &helper_read_roots,
             cwd.native.as_path(),
         );
+        // Linux resolves aliases in the sandbox helper. Doing it here also probes
+        // unrelated permission roots synchronously on the executor's runtime thread.
+        #[cfg(not(target_os = "linux"))]
         normalize_file_system_policy_root_aliases(&mut file_system_policy);
         let network_policy = NetworkSandboxPolicy::Restricted;
         let permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
@@ -119,6 +133,10 @@ impl FileSystemSandboxRunner {
     ) -> Result<SandboxExecRequest, JSONRPCErrorError> {
         let helper = &self.runtime_paths.codex_self_exe;
         let sandbox_manager = SandboxManager::for_file_system_helpers();
+        #[cfg(target_os = "macos")]
+        let sandbox_manager = sandbox_manager.with_allowed_symlinked_codex_home(
+            self.runtime_paths.allowed_symlinked_codex_home.clone(),
+        );
         let sandbox = sandbox_manager.select_initial(
             permission_profile,
             SandboxablePreference::Require,
@@ -223,7 +241,7 @@ fn add_helper_runtime_permissions(
     }
 
     for helper_read_root in helper_read_roots {
-        if file_system_policy.can_read_path_with_cwd(helper_read_root.as_path(), cwd) {
+        if file_system_policy.can_read_local_path_with_cwd(helper_read_root.as_path(), cwd) {
             continue;
         }
 
@@ -234,6 +252,7 @@ fn add_helper_runtime_permissions(
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn normalize_file_system_policy_root_aliases(file_system_policy: &mut FileSystemSandboxPolicy) {
     for entry in &mut file_system_policy.entries {
         // Alias normalization uses this executor's filesystem; leave foreign
@@ -246,6 +265,7 @@ fn normalize_file_system_policy_root_aliases(file_system_policy: &mut FileSystem
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn normalize_top_level_alias(path: AbsolutePathBuf) -> AbsolutePathBuf {
     let raw_path = path.to_path_buf();
     for ancestor in raw_path.ancestors() {
@@ -313,18 +333,110 @@ async fn run_command(
         .stdin
         .take()
         .ok_or_else(|| internal_error("failed to open fs sandbox helper stdin".to_string()))?;
-    stdin.write_all(&request_json).await.map_err(io_error)?;
-    stdin.shutdown().await.map_err(io_error)?;
-    drop(stdin);
 
-    let output = wait_for_helper_output(child).await?;
-    let response: FsHelperResponse = serde_json::from_slice(&output.stdout).map_err(json_error)?;
+    #[cfg(windows)]
+    let mut request_json = request_json;
+    #[cfg(windows)]
+    request_json.push(b'\n');
+    stdin.write_all(&request_json).await.map_err(io_error)?;
+
+    #[cfg(windows)]
+    let response = {
+        stdin.flush().await.map_err(io_error)?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| internal_error("failed to open fs sandbox helper stdout".to_string()))?;
+        let stderr = drain_helper_stderr(&mut child);
+        let response = read_helper_response(stdout).await;
+        drop(stdin);
+        reap_helper_after_response(child, stderr).await?;
+        response?
+    };
+
+    #[cfg(not(windows))]
+    let response = {
+        stdin.shutdown().await.map_err(io_error)?;
+        drop(stdin);
+        wait_for_helper_output(child).await?.stdout
+    };
+
+    let response = serde_json::from_slice(&response).map_err(json_error)?;
     match response {
         FsHelperResponse::Ok(payload) => Ok(payload),
         FsHelperResponse::Error(error) => Err(error),
     }
 }
 
+#[cfg(any(windows, test))]
+pub(crate) async fn read_helper_response(
+    stdout: impl tokio::io::AsyncRead + Unpin,
+) -> Result<Vec<u8>, JSONRPCErrorError> {
+    let mut response = Vec::new();
+    let bytes_read = tokio::io::BufReader::new(stdout)
+        .read_until(b'\n', &mut response)
+        .await
+        .map_err(io_error)?;
+    if bytes_read == 0 {
+        return Err(internal_error(
+            "fs sandbox helper closed stdout without responding".to_string(),
+        ));
+    }
+    Ok(response)
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn drain_helper_stderr(
+    child: &mut tokio::process::Child,
+) -> tokio::task::JoinHandle<Result<Vec<u8>, std::io::Error>> {
+    let stderr_pipe = child.stderr.take();
+    tokio::spawn(async move {
+        let mut stderr = Vec::new();
+        if let Some(mut stderr_pipe) = stderr_pipe {
+            (&mut stderr_pipe)
+                .take(MAX_FS_HELPER_STDERR_BYTES)
+                .read_to_end(&mut stderr)
+                .await?;
+            tokio::io::copy(&mut stderr_pipe, &mut tokio::io::sink()).await?;
+        }
+        Ok::<_, std::io::Error>(stderr)
+    })
+}
+
+#[cfg(any(windows, test))]
+pub(crate) async fn reap_helper_after_response(
+    mut child: tokio::process::Child,
+    stderr: tokio::task::JoinHandle<Result<Vec<u8>, std::io::Error>>,
+) -> Result<(), JSONRPCErrorError> {
+    let (status, stderr) = match tokio::time::timeout(FS_HELPER_EXIT_TIMEOUT, async {
+        tokio::try_join!(child.wait(), async {
+            stderr.await.map_err(std::io::Error::other)?
+        })
+    })
+    .await
+    {
+        Ok(result) => result.map_err(io_error)?,
+        Err(_) => {
+            tokio::time::timeout(FS_HELPER_EXIT_TIMEOUT, child.kill())
+                .await
+                .map_err(|_| {
+                    internal_error("fs sandbox helper did not stop after its response".to_string())
+                })?
+                .map_err(io_error)?;
+            return Ok(());
+        }
+    };
+    if status.success() {
+        return Ok(());
+    }
+
+    Err(internal_error(format!(
+        "fs sandbox helper failed with status {status}: {stderr}",
+        stderr = String::from_utf8_lossy(&stderr).trim()
+    )))
+}
+
+#[cfg(not(windows))]
 pub(crate) async fn wait_for_helper_output(
     child: tokio::process::Child,
 ) -> Result<std::process::Output, JSONRPCErrorError> {
@@ -391,6 +503,10 @@ fn json_error(err: serde_json::Error) -> JSONRPCErrorError {
         "failed to encode or decode fs sandbox helper message: {err}"
     ))
 }
+
+#[cfg(test)]
+#[path = "fs_sandbox_windows_tests.rs"]
+mod windows_tests;
 
 #[cfg(test)]
 mod tests {
@@ -465,8 +581,8 @@ mod tests {
             cwd.as_path(),
         );
 
-        assert!(policy.can_read_path_with_cwd(readable.as_path(), cwd.as_path()));
-        assert!(policy.can_write_path_with_cwd(writable.as_path(), cwd.as_path()));
+        assert!(policy.can_read_local_path_with_cwd(readable.as_path(), cwd.as_path()));
+        assert!(policy.can_write_local_path_with_cwd(writable.as_path(), cwd.as_path()));
     }
 
     #[test]
@@ -694,10 +810,13 @@ mod tests {
         );
 
         assert!(
-            policy.can_read_path_with_cwd(runtime_paths.codex_self_exe.as_path(), cwd.as_path())
+            policy.can_read_local_path_with_cwd(
+                runtime_paths.codex_self_exe.as_path(),
+                cwd.as_path(),
+            )
         );
-        assert!(!policy.can_read_path_with_cwd(parent.as_path(), cwd.as_path()));
-        assert!(!policy.can_read_path_with_cwd(sibling.as_path(), cwd.as_path()));
+        assert!(!policy.can_read_local_path_with_cwd(parent.as_path(), cwd.as_path()));
+        assert!(!policy.can_read_local_path_with_cwd(sibling.as_path(), cwd.as_path()));
     }
 
     #[test]
@@ -725,11 +844,14 @@ mod tests {
         );
 
         assert!(
-            policy.can_read_path_with_cwd(runtime_paths.codex_self_exe.as_path(), cwd.as_path())
+            policy.can_read_local_path_with_cwd(
+                runtime_paths.codex_self_exe.as_path(),
+                cwd.as_path(),
+            )
         );
-        assert!(policy.can_read_path_with_cwd(alias.as_path(), cwd.as_path()));
-        assert!(!policy.can_read_path_with_cwd(codex_parent.as_path(), cwd.as_path()));
-        assert!(!policy.can_read_path_with_cwd(alias_parent.as_path(), cwd.as_path()));
+        assert!(policy.can_read_local_path_with_cwd(alias.as_path(), cwd.as_path()));
+        assert!(!policy.can_read_local_path_with_cwd(codex_parent.as_path(), cwd.as_path()));
+        assert!(!policy.can_read_local_path_with_cwd(alias_parent.as_path(), cwd.as_path()));
     }
 
     fn restricted_policy(entries: Vec<FileSystemSandboxEntry>) -> FileSystemSandboxPolicy {

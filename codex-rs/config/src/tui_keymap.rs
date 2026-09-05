@@ -135,8 +135,12 @@ pub struct TuiChatKeymap {
     pub previous_permission_mode: Option<KeybindingsSpec>,
     /// Switch to the next available permission mode.
     pub next_permission_mode: Option<KeybindingsSpec>,
-    /// Edit the most recently queued message.
+    /// Move up through pending async questions, then edit the most recently queued message.
     pub edit_queued_message: Option<KeybindingsSpec>,
+    /// Move back through pending async questions toward the composer.
+    pub prompt_stack_back: Option<KeybindingsSpec>,
+    /// Skip the focused question.
+    pub skip_question: Option<KeybindingsSpec>,
 }
 
 /// Composer context keybindings. These override corresponding `global` actions.
@@ -217,6 +221,8 @@ pub struct TuiVimNormalKeymap {
     pub open_line_below: Option<KeybindingsSpec>,
     /// Open a new line above and enter insert mode (`O`).
     pub open_line_above: Option<KeybindingsSpec>,
+    /// Enter replace mode and overwrite characters under the cursor (`R`).
+    pub enter_replace_mode: Option<KeybindingsSpec>,
     /// Move cursor left (`h`).
     pub move_left: Option<KeybindingsSpec>,
     /// Move cursor right (`l`).
@@ -235,10 +241,24 @@ pub struct TuiVimNormalKeymap {
     pub move_line_start: Option<KeybindingsSpec>,
     /// Move cursor to end of line (`$`).
     pub move_line_end: Option<KeybindingsSpec>,
+    /// Find the next character on the current line (`f`).
+    pub find_forward: Option<KeybindingsSpec>,
+    /// Find the previous character on the current line (`F`).
+    pub find_backward: Option<KeybindingsSpec>,
+    /// Stop before the next character on the current line (`t`).
+    pub till_forward: Option<KeybindingsSpec>,
+    /// Stop after the previous character on the current line (`T`).
+    pub till_backward: Option<KeybindingsSpec>,
+    /// Begin a jump to the first buffer line (`gg`).
+    pub jump_top: Option<KeybindingsSpec>,
+    /// Jump to the last buffer line (`G`).
+    pub jump_bottom: Option<KeybindingsSpec>,
     /// Delete character under cursor (`x`).
     pub delete_char: Option<KeybindingsSpec>,
     /// Replace the character under the cursor (`r`).
     pub replace_char: Option<KeybindingsSpec>,
+    /// Repeat the last complete edit (`.`).
+    pub repeat_last_change: Option<KeybindingsSpec>,
     /// Delete character under cursor and enter insert mode (`s`).
     pub substitute_char: Option<KeybindingsSpec>,
     /// Delete from cursor to end of line (`D`).
@@ -255,6 +275,10 @@ pub struct TuiVimNormalKeymap {
     pub start_yank_operator: Option<KeybindingsSpec>,
     /// Begin change operator; next keys select a text object.
     pub start_change_operator: Option<KeybindingsSpec>,
+    /// Undo the last complete edit (`u`).
+    pub undo: Option<KeybindingsSpec>,
+    /// Redo the last undone edit (`ctrl-r`).
+    pub redo: Option<KeybindingsSpec>,
     /// Cancel a pending operator and return to normal mode.
     pub cancel_operator: Option<KeybindingsSpec>,
 }
@@ -290,12 +314,39 @@ pub struct TuiVimOperatorKeymap {
     pub motion_line_start: Option<KeybindingsSpec>,
     /// Motion: to end of line (`$`).
     pub motion_line_end: Option<KeybindingsSpec>,
+    /// Motion: find the next character on the current line (`f`).
+    pub motion_find_forward: Option<KeybindingsSpec>,
+    /// Motion: find the previous character on the current line (`F`).
+    pub motion_find_backward: Option<KeybindingsSpec>,
+    /// Motion: stop before the next character on the current line (`t`).
+    pub motion_till_forward: Option<KeybindingsSpec>,
+    /// Motion: stop after the previous character on the current line (`T`).
+    pub motion_till_backward: Option<KeybindingsSpec>,
+    /// Motion: begin a jump to the first buffer line (`gg`).
+    pub motion_jump_top: Option<KeybindingsSpec>,
+    /// Motion: jump to the last buffer line (`G`).
+    pub motion_jump_bottom: Option<KeybindingsSpec>,
     /// Select an inner text object after an operator.
     pub select_inner_text_object: Option<KeybindingsSpec>,
     /// Select an around text object after an operator.
     pub select_around_text_object: Option<KeybindingsSpec>,
     /// Cancel the pending operator and return to normal mode.
     pub cancel: Option<KeybindingsSpec>,
+}
+
+/// Search motions shared by Vim normal and operator-pending input.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct TuiVimSearchKeymap {
+    /// Search forward in the active buffer (`/`).
+    pub forward: Option<KeybindingsSpec>,
+    /// Search backward in the active buffer (`?`).
+    pub backward: Option<KeybindingsSpec>,
+    /// Repeat the accepted search (`n`).
+    pub next: Option<KeybindingsSpec>,
+    /// Repeat in the opposite direction (`N`).
+    pub previous: Option<KeybindingsSpec>,
 }
 
 /// Vim text-object keybindings for modal editing inside text areas.
@@ -382,6 +433,8 @@ pub struct TuiListKeymap {
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiAgentsKeymap {
+    /// Open the session resume picker.
+    pub resume: Option<KeybindingsSpec>,
     /// Search the available agent tasks.
     pub search: Option<KeybindingsSpec>,
     /// Start composing a new agent task.
@@ -443,6 +496,8 @@ pub struct TuiKeymap {
     pub vim_normal: TuiVimNormalKeymap,
     #[serde(default)]
     pub vim_operator: TuiVimOperatorKeymap,
+    #[serde(default)]
+    pub vim_search: TuiVimSearchKeymap,
     #[serde(default)]
     pub vim_text_object: TuiVimTextObjectKeymap,
     #[serde(default)]

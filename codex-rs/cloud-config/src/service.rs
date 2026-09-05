@@ -2,6 +2,7 @@
 //!
 //! Startup loads a shared bundle from cache or backend, and background refresh
 //! updates both the on-disk cache and the bundle observed by future config loads.
+//! One-shot network loads can disable disk-cache reads and writes.
 
 use crate::backend::BundleClient;
 use crate::backend::BundleRequestError;
@@ -34,6 +35,7 @@ use tokio::time::timeout;
 pub(crate) const CLOUD_CONFIG_BUNDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const CLOUD_CONFIG_BUNDLE_MAX_ATTEMPTS: usize = 5;
 const CLOUD_CONFIG_BUNDLE_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const CLOUD_CONFIG_BUNDLE_TIMEOUT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const CLOUD_CONFIG_BUNDLE_LOAD_FAILED_MESSAGE: &str =
     "Failed to load cloud config bundle (workspace-managed policies).";
 const CLOUD_CONFIG_BUNDLE_AUTH_RECOVERY_FAILED_MESSAGE: &str = concat!(
@@ -77,6 +79,7 @@ pub(crate) struct CloudConfigBundleService<C> {
     auth_manager: Arc<AuthManager>,
     client: Arc<C>,
     cache: CloudConfigBundleCache,
+    cache_enabled: bool,
     codex_home: AbsolutePathBuf,
     timeout: Duration,
     latest_bundle: OnceCell<Mutex<Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError>>>,
@@ -97,10 +100,16 @@ where
             auth_manager,
             client,
             cache: CloudConfigBundleCache::new(codex_home.clone()),
+            cache_enabled: true,
             codex_home,
             timeout,
             latest_bundle: OnceCell::new(),
         }
+    }
+
+    pub(crate) fn without_cache(mut self) -> Self {
+        self.cache_enabled = false;
+        self
     }
 
     pub(crate) async fn get_latest(
@@ -181,15 +190,17 @@ where
             return Ok(None);
         }
 
-        // Startup prefers a valid, identity-matched cache entry. The backend is
-        // only consulted on cache miss or invalid cache contents.
-        let (chatgpt_user_id, account_id) = auth_identity(&auth);
-        match self
-            .load_valid_cached_bundle(chatgpt_user_id.as_deref(), account_id.as_deref())
-            .await
-        {
-            CachedBundleLookup::Hit(bundle) => return Ok(bundle),
-            CachedBundleLookup::Miss => {}
+        if self.cache_enabled {
+            // Startup prefers a valid, identity-matched cache entry. The backend is
+            // only consulted on cache miss or invalid cache contents.
+            let (chatgpt_user_id, account_id) = auth_identity(&auth);
+            match self
+                .load_valid_cached_bundle(chatgpt_user_id.as_deref(), account_id.as_deref())
+                .await
+            {
+                CachedBundleLookup::Hit(bundle) => return Ok(bundle),
+                CachedBundleLookup::Miss => {}
+            }
         }
 
         self.fetch_remote_bundle_and_update_cache_with_retries(auth, "startup")
@@ -321,10 +332,11 @@ where
         }
 
         let (chatgpt_user_id, account_id) = auth_identity(auth);
-        if let Err(err) = self
-            .cache
-            .save(chatgpt_user_id, account_id, bundle.clone())
-            .await
+        if self.cache_enabled
+            && let Err(err) = self
+                .cache
+                .save(chatgpt_user_id, account_id, bundle.clone())
+                .await
         {
             tracing::warn!(
                 error = %err,
@@ -459,7 +471,18 @@ where
 
     pub(crate) async fn refresh_cache_in_background(&self) {
         loop {
-            sleep(CLOUD_CONFIG_BUNDLE_CACHE_REFRESH_INTERVAL).await;
+            let mut refresh_interval = CLOUD_CONFIG_BUNDLE_CACHE_REFRESH_INTERVAL;
+            if let Some(latest_bundle) = self.latest_bundle.get()
+                && matches!(
+                    &*latest_bundle.lock().await,
+                    Err(error) if error.code() == CloudConfigBundleLoadErrorCode::Timeout
+                )
+            {
+                // Recover startup timeouts through this worker without making
+                // readers fetch concurrently or extending the startup deadline.
+                refresh_interval = CLOUD_CONFIG_BUNDLE_TIMEOUT_RETRY_INTERVAL;
+            }
+            sleep(refresh_interval).await;
             match timeout(self.timeout, self.refresh_cache_once()).await {
                 Ok(true) => {}
                 Ok(false) => break,

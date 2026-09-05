@@ -145,7 +145,6 @@ impl ChatWidget {
     }
 
     pub(super) fn dispatch_command(&mut self, cmd: SlashCommand) {
-        self.flush_completed_command_activity();
         if !self.ensure_slash_command_allowed_in_side_conversation(cmd) {
             return;
         }
@@ -258,7 +257,7 @@ impl ChatWidget {
                     .send(AppEvent::OpenDesktopThread { thread_id });
             }
             SlashCommand::Init => {
-                const INIT_PROMPT: &str = include_str!("../../prompt_for_init_command.md");
+                const INIT_PROMPT: &str = include_str!("../../assets/prompt_for_init_command.md");
                 self.submit_user_message(INIT_PROMPT.to_string().into());
             }
             SlashCommand::Compact => {
@@ -270,8 +269,25 @@ impl ChatWidget {
                 if !self.bottom_pane.is_task_running() {
                     self.bottom_pane.set_task_running(/*running*/ true);
                 }
+                self.bottom_pane.ensure_status_indicator();
+                self.set_status(
+                    compaction::COMPACTION_HEADER.to_string(),
+                    Some(compaction::COMPACTION_DETAILS.to_string()),
+                    StatusDetailsCapitalization::Preserve,
+                    STATUS_DETAILS_DEFAULT_MAX_LINES,
+                );
                 self.input_queue.user_turn_pending_start = true;
                 self.app_event_tx.compact();
+            }
+            SlashCommand::Recap => {
+                let Some(thread_id) = self.thread_id else {
+                    self.add_error_message(
+                        "Session is still starting; try /recap again in a moment.".to_string(),
+                    );
+                    return;
+                };
+                self.app_event_tx
+                    .send(AppEvent::GenerateRecap { thread_id });
             }
             SlashCommand::Review => {
                 self.open_review_popup();
@@ -320,7 +336,11 @@ impl ChatWidget {
                 self.app_event_tx.send(AppEvent::OpenAgentPicker);
             }
             SlashCommand::Permissions => {
-                self.open_permissions_popup();
+                if self.remote_connection.is_some() {
+                    self.app_event_tx.send(AppEvent::OpenPermissionsPopup);
+                } else {
+                    self.open_permissions_popup();
+                }
                 self.defer_input_until_settings_applied();
             }
             SlashCommand::Vim => {
@@ -655,6 +675,9 @@ impl ChatWidget {
             .set_composer_text(String::new(), Vec::new(), Vec::new());
         self.bottom_pane.set_composer_pending_pastes(Vec::new());
         self.bottom_pane.drain_pending_submission_state();
+        if self.bottom_pane.composer_is_vim_enabled() {
+            self.bottom_pane.enable_vim_in_insert_mode();
+        }
     }
 
     fn prepared_inline_user_message(
@@ -731,7 +754,8 @@ impl ChatWidget {
             SlashCommand::Keymap => match trimmed.to_ascii_lowercase().as_str() {
                 "" => self.open_keymap_picker(),
                 "debug" => {
-                    match crate::keymap::RuntimeKeymap::from_config(&self.config.tui_keymap) {
+                    match crate::keymap::RuntimeKeymap::from_config(&self.local_settings.tui.keymap)
+                    {
                         Ok(runtime_keymap) => self.open_keymap_debug(&runtime_keymap),
                         Err(err) => {
                             self.add_error_message(format!(
@@ -781,9 +805,7 @@ impl ChatWidget {
                 });
             }
             SlashCommand::Plan if !trimmed.is_empty() => {
-                if !self.apply_plan_slash_command() {
-                    return;
-                }
+                let plan_available = self.apply_plan_slash_command();
                 let mut user_message = self.prepared_inline_user_message(
                     args,
                     text_elements,
@@ -792,7 +814,8 @@ impl ChatWidget {
                     mention_bindings,
                     source,
                 );
-                if !self.is_session_configured()
+                if !plan_available
+                    || !self.is_session_configured()
                     || self.current_model().trim().is_empty()
                     || (!self.current_model_supports_images()
                         && (!user_message.local_images.is_empty()
@@ -804,6 +827,10 @@ impl ChatWidget {
                         element.byte_range.start += PLAN_PREFIX.len();
                         element.byte_range.end += PLAN_PREFIX.len();
                     }
+                }
+                if !plan_available {
+                    self.restore_user_message_to_composer(user_message);
+                    return;
                 }
                 if self.is_session_configured() {
                     self.reasoning_buffer.clear();
@@ -1139,6 +1166,7 @@ impl ChatWidget {
             | SlashCommand::Diff
             | SlashCommand::App
             | SlashCommand::Rename
+            | SlashCommand::Recap
             | SlashCommand::TestApproval => QueueDrain::Continue,
             SlashCommand::Cd => match self.thread_id {
                 Some(thread_id) if self.can_change_working_directory(thread_id) => QueueDrain::Stop,

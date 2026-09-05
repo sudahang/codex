@@ -13,14 +13,19 @@ mod collaboration_mode_list;
 #[cfg(unix)]
 mod command_exec;
 mod compaction;
+mod config_requirements_application;
+#[path = "config_requirements_browser_use_tests.rs"]
+mod config_requirements_browser_use;
 mod config_requirements_in_app_browser;
 mod config_rpc;
 mod connection_handling_websocket;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod connection_handling_websocket_unix;
 #[cfg(unix)]
 mod curated_mcp_sync;
 mod current_time;
+mod cyber_access_program;
+mod daybreak_access;
 mod dynamic_tools;
 mod environment_add;
 mod environment_info;
@@ -42,6 +47,7 @@ mod hooks_list;
 mod host_skills;
 mod imagegen_extension;
 mod initialize;
+mod luna_reserve;
 mod marketplace_add;
 mod marketplace_remove;
 mod marketplace_upgrade;
@@ -64,6 +70,7 @@ mod plan_item;
 mod plugin_install;
 mod plugin_list;
 mod plugin_read;
+mod plugin_reconcile;
 mod plugin_search;
 mod plugin_share;
 mod plugin_uninstall;
@@ -93,6 +100,7 @@ mod skills_list;
 mod sleep;
 mod thread_archive;
 mod thread_delete;
+mod thread_environments;
 mod thread_fork;
 mod thread_inject_items;
 mod thread_list;
@@ -110,9 +118,12 @@ mod thread_settings_update;
 mod thread_shell_command;
 mod thread_start;
 mod thread_status;
+mod thread_timeline;
 mod thread_unarchive;
 mod thread_unsubscribe;
+mod turn_cost_otel;
 mod turn_interrupt;
+mod turn_settings_update;
 mod turn_start;
 mod turn_start_zsh_fork;
 mod turn_steer;

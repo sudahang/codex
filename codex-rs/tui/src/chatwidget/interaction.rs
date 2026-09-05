@@ -2,13 +2,21 @@
 
 use super::*;
 use crate::bottom_pane::BottomPaneView;
+use crate::clipboard_copy::CopyFormat;
 
 impl ChatWidget {
+    pub(crate) fn set_agents_navigation_enabled(&mut self, enabled: bool) {
+        self.bottom_pane.set_agents_navigation_enabled(enabled);
+    }
+
     pub(crate) fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
         self.bottom_pane.keymap_contexts()
     }
 
     pub(crate) fn handle_key_event(&mut self, key_event: KeyEvent) {
+        if self.handle_question_key(key_event) {
+            return;
+        }
         if self.bottom_pane.has_active_view()
             && !matches!(
                 key_event,
@@ -25,7 +33,6 @@ impl ChatWidget {
             let should_pause_active_goal = self
                 .bottom_pane
                 .active_view_will_interrupt_turn_on_key_event(key_event);
-            self.flush_completed_command_activity();
             self.bottom_pane.handle_key_event(key_event);
             if should_pause_active_goal {
                 self.pause_active_goal_for_interrupt();
@@ -176,10 +183,8 @@ impl ChatWidget {
                 let had_modal_or_popup = !self.bottom_pane.no_modal_or_popup_active();
                 let should_pause_active_goal =
                     self.bottom_pane.should_interrupt_running_task(key_event);
-                if key_event.code == KeyCode::Enter {
-                    self.flush_completed_command_activity();
-                }
                 let input_result = self.bottom_pane.handle_key_event(key_event);
+                self.sync_backend_banner_view();
                 if should_pause_active_goal {
                     self.pause_active_goal_for_interrupt();
                 }
@@ -248,6 +253,10 @@ impl ChatWidget {
         self.bottom_pane.selected_index_for_present_view(view_id)
     }
 
+    pub(crate) fn selected_index_for_active_view(&self, view_id: &'static str) -> Option<usize> {
+        self.bottom_pane.selected_index_for_active_view(view_id)
+    }
+
     pub(crate) fn replace_selection_view_if_present(
         &mut self,
         view_id: &'static str,
@@ -278,9 +287,11 @@ impl ChatWidget {
         false
     }
 
-    /// Copy the last agent response (raw markdown) to the system clipboard.
+    /// Copy the last response as Markdown with HTML for rich-text destinations.
     pub(crate) fn copy_last_agent_markdown(&mut self) {
-        self.copy_last_agent_markdown_with(crate::clipboard_copy::copy_to_clipboard);
+        self.copy_last_agent_markdown_with(|text| {
+            crate::clipboard_copy::copy_to_clipboard(text, CopyFormat::Markdown)
+        });
     }
 
     /// Inner implementation with an injectable clipboard backend for testing.
@@ -322,6 +333,7 @@ impl ChatWidget {
         let mut choices = vec![(
             "Whole response".to_string(),
             Arc::<str>::from(markdown.as_str()),
+            CopyFormat::Markdown,
         )];
         let source = self
             .transcript
@@ -338,21 +350,27 @@ impl ChatWidget {
                             |language| format!("{language} code"),
                         ),
                         content,
+                        CopyFormat::PlainText,
                     )),
                     crate::markdown::CopyTarget::Quote(content) => {
                         let content: String = content
                             .split_inclusive('\n')
                             .map(|line| crate::git_action_directives::strip_line_directives(line).0)
                             .collect();
-                        (!content.trim().is_empty())
-                            .then(|| ("Blockquote".to_string(), Arc::from(content)))
+                        (!content.trim().is_empty()).then(|| {
+                            (
+                                "Blockquote".to_string(),
+                                Arc::from(content),
+                                CopyFormat::PlainText,
+                            )
+                        })
                     }
                 }),
         );
 
         let items = choices
             .into_iter()
-            .map(|(label, text)| {
+            .map(|(label, text, format)| {
                 let description = text
                     .lines()
                     .find(|line| !line.trim().is_empty())
@@ -364,6 +382,7 @@ impl ChatWidget {
                         tx.send(AppEvent::CopySelection {
                             text: Arc::clone(&text),
                             label: label.clone(),
+                            format,
                         });
                     })],
                     dismiss_on_select: true,
@@ -381,8 +400,10 @@ impl ChatWidget {
         self.defer_input_until_settings_applied();
     }
 
-    pub(crate) fn copy_selection(&mut self, text: Arc<str>, label: String) {
-        self.copy_selection_with(&text, &label, crate::clipboard_copy::copy_to_clipboard);
+    pub(crate) fn copy_selection(&mut self, text: Arc<str>, label: String, format: CopyFormat) {
+        self.copy_selection_with(&text, &label, |text| {
+            crate::clipboard_copy::copy_to_clipboard(text, format)
+        });
     }
 
     pub(super) fn copy_selection_with(
@@ -417,7 +438,10 @@ impl ChatWidget {
         } else {
             "Name thread"
         };
-        let view = CustomPromptView::new(
+        let suggestion_request = self
+            .thread_id
+            .map(|thread_id| (thread_id, uuid::Uuid::new_v4()));
+        let mut view = CustomPromptView::new(
             title.to_string(),
             "Type a name and press Enter".to_string(),
             /*initial_text*/ existing_name.unwrap_or_default().to_string(),
@@ -432,7 +456,32 @@ impl ChatWidget {
                 tx.set_thread_name(name);
             }),
         );
+        if let Some((_, request_id)) = suggestion_request {
+            view = view.with_text_suggestion(
+                request_id,
+                "Generating a title suggestion…".to_string(),
+                "Suggested from this conversation".to_string(),
+            );
+        }
         self.bottom_pane.show_text_prompt(view);
+        if let Some((thread_id, request_id)) = suggestion_request {
+            self.app_event_tx.send(AppEvent::SuggestThreadName {
+                thread_id,
+                request_id,
+            });
+        }
+    }
+
+    pub(crate) fn apply_thread_name_suggestion(
+        &mut self,
+        thread_id: ThreadId,
+        request_id: uuid::Uuid,
+        suggestion: Option<&str>,
+    ) {
+        if self.thread_id == Some(thread_id) {
+            self.bottom_pane
+                .apply_text_suggestion(request_id, suggestion);
+        }
     }
 
     pub(super) fn ensure_thread_rename_allowed(&mut self) -> bool {
@@ -475,7 +524,7 @@ impl ChatWidget {
     ///
     /// When the double-press quit shortcut is enabled, pressing the same shortcut again before
     /// expiry requests a shutdown-first quit.
-    fn on_ctrl_c(&mut self) {
+    pub(super) fn on_ctrl_c(&mut self) {
         let key = key_hint::ctrl(KeyCode::Char('c'));
         let modal_or_popup_active = !self.bottom_pane.no_modal_or_popup_active();
         let should_pause_active_goal = self

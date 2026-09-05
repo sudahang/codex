@@ -169,6 +169,25 @@ async fn thread_section_operations_without_sqlite_return_method_not_found() -> R
 }
 
 #[tokio::test]
+async fn thread_start_defaults_to_legacy_without_history_list_support() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    let store_id = Uuid::new_v4().to_string();
+    create_config_toml_with_thread_store(codex_home.path(), &server.uri(), &store_id)?;
+
+    let _in_memory_store = InMemoryThreadStoreId { store_id };
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+
+    let ThreadStartResponse { thread, .. } = mcp.start_thread(ThreadStartParams::default()).await?;
+
+    assert_eq!(thread.history_mode, ThreadHistoryMode::Legacy);
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_start_rejects_paginated_history_without_list_support() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
@@ -271,6 +290,7 @@ async fn thread_delete_with_non_local_thread_store_does_not_create_local_persist
         .request(ClientRequest::ThreadList {
             request_id: RequestId::Integer(3),
             params: ThreadListParams {
+                originators: None,
                 cursor: None,
                 limit: Some(10),
                 sort_key: None,
@@ -350,7 +370,7 @@ async fn thread_delete_with_non_local_thread_store_does_not_create_local_persist
 }
 
 #[tokio::test]
-async fn cold_thread_resume_reuses_non_local_history_probe() -> Result<()> {
+async fn cold_thread_resume_rechecks_non_local_history_after_config_load() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     let store_id = Uuid::new_v4().to_string();
@@ -412,7 +432,8 @@ async fn cold_thread_resume_reuses_non_local_history_probe() -> Result<()> {
     let client = start_in_process_client(config, loader_overrides).await?;
     let reads_before_resume = thread_store.calls().await.read_thread_with_history;
     // The in-memory store is pathless, so resume currently fails later while
-    // assembling the response. The history-bearing probe must still be reused.
+    // assembling the response. Reuse the probe within each attempt, but read it
+    // again after loading configuration without the metadata permit.
     let _resume_result = client
         .request(ClientRequest::ThreadResume {
             request_id: RequestId::Integer(3),
@@ -423,12 +444,9 @@ async fn cold_thread_resume_reuses_non_local_history_probe() -> Result<()> {
         })
         .await?;
 
-    assert_eq!(
-        thread_store.calls().await.read_thread_with_history,
-        reads_before_resume + 1
-    );
-
+    let reads_after_resume = thread_store.calls().await.read_thread_with_history;
     client.shutdown().await?;
+    assert_eq!(reads_after_resume, reads_before_resume + 2);
     Ok(())
 }
 

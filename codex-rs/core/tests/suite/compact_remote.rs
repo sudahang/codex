@@ -16,7 +16,6 @@ use codex_features::Feature;
 use codex_history::CodexHarnessMetadata;
 use codex_history::InitialHistory;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_login::auth::AgentIdentityAuth;
 use codex_login::auth::AgentIdentityAuthRecord;
@@ -51,6 +50,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RealtimeConversationRealtimeEvent;
 use codex_protocol::protocol::RealtimeEvent;
 use codex_protocol::protocol::RealtimeOutputModality;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::PathBufExt;
@@ -220,6 +220,7 @@ fn compacted_summary_only_output(summary: &str) -> Vec<ResponseItem> {
 
 fn test_codex() -> TestCodexBuilder {
     base_test_codex().with_config(|config| {
+        config.update_plan_enabled = true;
         let _ = config.features.disable(Feature::RemoteCompactionV2);
     })
 }
@@ -402,7 +403,7 @@ fn annotate_retained_user_in_rollout(path: &Path, retained_text: &str) -> Result
     let mut rollout = fs::read_to_string(path)?
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(serde_json::from_str::<RolloutLine>)
+        .map(codex_rollout::parse_rollout_line)
         .collect::<std::result::Result<Vec<_>, _>>()?;
     rollout
         .iter_mut()
@@ -430,7 +431,7 @@ fn assert_compacted_user_metadata(path: &Path, retained_text: &str) -> Result<()
     let replacement_history = fs::read_to_string(path)?
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(serde_json::from_str::<RolloutLine>)
+        .map(codex_rollout::parse_rollout_line)
         .collect::<std::result::Result<Vec<_>, _>>()?
         .into_iter()
         .rev()
@@ -667,7 +668,7 @@ async fn remote_compact_v2_retains_only_client_developer_messages_when_enabled(
     codex.shutdown_and_wait().await?;
     let replacement_history = fs::read_to_string(&rollout_path)?
         .lines()
-        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+        .filter_map(|line| codex_rollout::parse_rollout_line(line).ok())
         .filter_map(|line| match line.item {
             RolloutItem::Compacted(compacted) => compacted.replacement_history,
             _ => None,
@@ -683,6 +684,67 @@ async fn remote_compact_v2_retains_only_client_developer_messages_when_enabled(
         })
         .count();
     assert_eq!(retained_client_developers, usize::from(enabled));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_compact_v2_records_usage_before_output_validation() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let harness = TestCodexHarness::with_auto_env_builder(
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(|config| {
+                config
+                    .features
+                    .enable(Feature::RemoteCompactionV2)
+                    .expect("remote compaction v2 should be configurable");
+            }),
+    )
+    .await?;
+    let codex = &harness.test().codex;
+    let rollout_path = codex.rollout_path().context("rollout path")?;
+    responses::mount_sse_sequence(
+        harness.server(),
+        vec![
+            sse(vec![responses::ev_completed("before-compact")]),
+            sse(vec![
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "FIRST_SUMMARY",
+                    },
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "SECOND_SUMMARY",
+                    },
+                }),
+                responses::ev_completed_with_tokens("invalid-compact", /*total_tokens*/ 8_200),
+            ]),
+        ],
+    )
+    .await;
+
+    harness.test().submit_turn("before compact").await?;
+    codex.submit(Op::Compact).await?;
+    wait_for_event(codex, |event| matches!(event, EventMsg::Error(_))).await;
+    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    codex.shutdown_and_wait().await?;
+
+    let record = fs::read_to_string(&rollout_path)?
+        .lines()
+        .filter_map(|line| codex_rollout::parse_rollout_line(line).ok())
+        .filter_map(|line| match line.item {
+            RolloutItem::TokenUsageRecord(record) => Some(record),
+            _ => None,
+        })
+        .find(|record| record.response_id == "invalid-compact")
+        .context("remote compaction usage record")?;
+    assert_eq!(record.usage.total_tokens, 8_200);
 
     Ok(())
 }
@@ -770,7 +832,9 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let harness = TestCodexHarness::with_builder(
-        test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+        test_codex()
+            .with_history_mode(ThreadHistoryMode::Paginated)
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
     )
     .await?;
     let codex = harness.test().codex.clone();
@@ -865,6 +929,7 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
         compact_metadata["window_id"].as_str(),
         compact_request.header("x-codex-window-id").as_deref()
     );
+    assert_eq!(compact_metadata["window_number"].as_u64(), Some(0));
     assert!(compact_metadata["context_window_id"].as_str().is_some());
     assert_eq!(
         compact_metadata["compaction"],
@@ -1194,7 +1259,7 @@ async fn assert_remote_manual_compact_request_parity(
         .await?;
     wait_for_turn_complete(&codex).await;
 
-    codex.submit(Op::Compact).await?;
+    let compact_turn_id = codex.submit(Op::Compact).await?;
     wait_for_turn_complete(&codex).await;
 
     let response_requests = responses_mock.requests();
@@ -1215,6 +1280,13 @@ async fn assert_remote_manual_compact_request_parity(
     let compact_request = compact_mock.single_request();
     let normal_body = normal_request.body_json();
     let compact_body = compact_request.body_json();
+    let compact_metadata: Value = serde_json::from_str(
+        &compact_request
+            .header("x-codex-turn-metadata")
+            .expect("compaction turn metadata"),
+    )?;
+    assert_eq!(compact_metadata["turn_id"], compact_turn_id);
+    assert_eq!(compact_metadata["root_turn_id"], compact_turn_id);
     let expected_routing_hint = |body: &Value| {
         if !uses_codex_backend {
             return None;
@@ -1328,7 +1400,7 @@ async fn remote_manual_compact_chatgpt_auth_reuses_service_tier_and_prompt_cache
     Ok(())
 }
 
-#[test_case(None; "default_preserves_images")]
+#[test_case(None; "default_trims_images")]
 #[test_case(Some(false); "disabled_preserves_images")]
 #[test_case(Some(true); "enabled_trims_images")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1433,7 +1505,7 @@ async fn remote_compact_v2_charges_retained_images_to_token_budget(
             follow_up.inputs_of_type("compaction")[0]["encrypted_content"],
             "IMAGE_BUDGET_SUMMARY"
         );
-        let dropped = if image_budget_enabled == Some(true) {
+        let dropped = if image_budget_enabled.unwrap_or(true) {
             cycle
         } else {
             0
@@ -1586,6 +1658,7 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
                     .to_string(),
                 /*trigger_turn*/ false,
             ),
+            start_options: Default::default(),
         })
         .await?;
     codex
@@ -1597,6 +1670,7 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
                 "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/child\nPayload:\nchild completion".to_string(),
                 /*trigger_turn*/ false,
             ),
+            start_options: Default::default(),
         })
         .await?;
     let delegated_task_ciphertext = format!("delegated compact task{}", "x".repeat(40_000));
@@ -1609,6 +1683,7 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
                 delegated_task_ciphertext.clone(),
                 /*trigger_turn*/ true,
             ),
+            start_options: Default::default(),
         })
         .await?;
     wait_for_turn_complete(&codex).await;
@@ -1624,6 +1699,7 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
                 descendant_followup_ciphertext.to_string(),
                 /*trigger_turn*/ true,
             ),
+            start_options: Default::default(),
         })
         .await?;
     wait_for_turn_complete(&codex).await;
@@ -1824,6 +1900,7 @@ async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result
 
     let harness = TestCodexHarness::with_builder(
         test_codex()
+            .with_history_mode(ThreadHistoryMode::Paginated)
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
                 let _ = config.features.enable(Feature::RemoteCompactionV2);
@@ -1892,7 +1969,6 @@ async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result
         response_requests.len(),
         "expected initial turn, failed open, failed stream, compact retry, and follow-up turn"
     );
-
     for compact_request in &response_requests[1..=3] {
         assert_eq!("/v1/responses", compact_request.path());
         let compact_metadata: Value = serde_json::from_str(
@@ -1900,6 +1976,7 @@ async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result
                 .header("x-codex-turn-metadata")
                 .expect("v2 compact request should include turn metadata"),
         )?;
+        assert_eq!(compact_metadata["window_number"].as_u64(), Some(0));
         assert!(compact_metadata["context_window_id"].as_str().is_some());
         assert!(
             compact_request
@@ -3278,7 +3355,7 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
         .map(str::trim)
         .filter(|l| !l.is_empty())
     {
-        let Ok(entry) = serde_json::from_str::<RolloutLine>(line) else {
+        let Ok(entry) = codex_rollout::parse_rollout_line(line) else {
             continue;
         };
         if let RolloutItem::Compacted(compacted) = entry.item

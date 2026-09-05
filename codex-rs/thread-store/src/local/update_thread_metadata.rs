@@ -2,6 +2,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use chrono::Utc;
+use codex_protocol::SanitizedGitUrl;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::SessionSource;
@@ -405,6 +406,7 @@ async fn apply_metadata_update(
             if let Some(source) = patch.source {
                 metadata.source = enum_to_string(&source);
             }
+            metadata.originator = metadata.originator.or(patch.originator);
             if let Some(thread_source) = patch.thread_source {
                 metadata.thread_source = thread_source;
             }
@@ -448,6 +450,9 @@ async fn apply_metadata_update(
             }
             if let Some(project_id) = project_id.as_ref() {
                 metadata.project_id = project_id.clone();
+            }
+            if let Some(daybreak_enabled) = patch.daybreak_enabled {
+                metadata.daybreak_enabled = Some(daybreak_enabled);
             }
             let upsert_result = state_db.upsert_thread(&metadata).await;
             if existing.is_none()
@@ -537,6 +542,22 @@ async fn apply_metadata_update(
                     .map_err(|err| ThreadStoreError::Internal {
                         message: format!("failed to update memory mode for {thread_id}: {err}"),
                     })?;
+            }
+            if let Some(daybreak_enabled) = patch.daybreak_enabled
+                && !state_db
+                    .set_thread_daybreak_enabled(thread_id, daybreak_enabled)
+                    .await
+                    .map_err(|err| ThreadStoreError::Internal {
+                        message: format!(
+                            "failed to update Daybreak preference for {thread_id}: {err}"
+                        ),
+                    })?
+            {
+                return Err(ThreadStoreError::Internal {
+                    message: format!(
+                        "thread metadata unavailable before Daybreak update: {thread_id}"
+                    ),
+                });
             }
             Ok(())
         }
@@ -653,9 +674,11 @@ fn sqlite_write_failure_should_block(patch: &ThreadMetadataPatch) -> bool {
     // transcript-derived metadata, thread names, and memory-mode indexing were log-only. Keep that
     // failure isolation so a corrupted optional state DB does not make JSONL transcript durability
     // look broken. Explicit git-only updates still require SQLite because partial git patches need
-    // the existing SQLite value to preserve unspecified fields. Project updates always require
-    // SQLite because assignment only exists in the state database.
-    patch.project_id.is_some() || (patch.git_info.is_some() && !has_observed_metadata_facts(patch))
+    // the existing SQLite value to preserve unspecified fields. Project and Daybreak updates
+    // require SQLite because those preferences only exist in the state database.
+    patch.project_id.is_some()
+        || patch.daybreak_enabled.is_some()
+        || (patch.git_info.is_some() && !has_observed_metadata_facts(patch))
 }
 
 fn sqlite_write_error_is_best_effort(err: &ThreadStoreError) -> bool {
@@ -671,6 +694,7 @@ fn has_observed_metadata_facts(patch: &ThreadMetadataPatch) -> bool {
         || patch.reasoning_effort.is_some()
         || patch.created_at.is_some()
         || patch.source.is_some()
+        || patch.originator.is_some()
         || patch.thread_source.is_some()
         || patch.agent_nickname.is_some()
         || patch.agent_role.is_some()
@@ -708,7 +732,7 @@ async fn apply_thread_git_info_patch(
             git_info
                 .origin_url
                 .as_ref()
-                .map(|origin_url| origin_url.as_deref()),
+                .map(|origin_url| origin_url.as_ref()),
         )
         .await
         .map_err(|err| ThreadStoreError::Internal {
@@ -728,7 +752,7 @@ async fn apply_thread_git_info(
     thread_id: ThreadId,
     sha: &Option<String>,
     branch: &Option<String>,
-    origin_url: &Option<String>,
+    origin_url: &Option<SanitizedGitUrl>,
 ) -> ThreadStoreResult<()> {
     let Some(state_db) = store.state_db().await else {
         return Err(ThreadStoreError::Internal {
@@ -740,7 +764,7 @@ async fn apply_thread_git_info(
             thread_id,
             Some(sha.as_deref()),
             Some(branch.as_deref()),
-            Some(origin_url.as_deref()),
+            Some(origin_url.as_ref()),
         )
         .await
         .map_err(|err| ThreadStoreError::Internal {
@@ -758,7 +782,7 @@ async fn apply_thread_git_info(
 fn resolve_git_info_patch(
     existing: Option<GitInfo>,
     git_info: GitInfoPatch,
-) -> (Option<String>, Option<String>, Option<String>) {
+) -> (Option<String>, Option<String>, Option<SanitizedGitUrl>) {
     let (existing_sha, existing_branch, existing_origin_url) = match existing {
         Some(info) => (
             info.commit_hash.map(|sha| sha.0),
@@ -778,7 +802,7 @@ async fn apply_thread_git_info_to_rollout(
     thread_id: ThreadId,
     sha: &Option<String>,
     branch: &Option<String>,
-    origin_url: &Option<String>,
+    origin_url: &Option<SanitizedGitUrl>,
     memory_mode: Option<&str>,
 ) -> ThreadStoreResult<()> {
     let mut session_meta =
@@ -1435,7 +1459,10 @@ mod tests {
                     git_info: Some(GitInfoPatch {
                         sha: Some(Some("abc123".to_string())),
                         branch: Some(Some("main".to_string())),
-                        origin_url: Some(Some("https://github.com/openai/codex".to_string())),
+                        origin_url: Some(Some(
+                            SanitizedGitUrl::try_from("https://github.com/openai/codex")
+                                .expect("valid git remote URL"),
+                        )),
                     }),
                     ..Default::default()
                 },
@@ -1536,7 +1563,10 @@ mod tests {
                     git_info: Some(GitInfoPatch {
                         sha: Some(Some("abc123".to_string())),
                         branch: Some(Some("main".to_string())),
-                        origin_url: Some(Some("https://github.com/openai/codex".to_string())),
+                        origin_url: Some(Some(
+                            SanitizedGitUrl::try_from("https://github.com/openai/codex")
+                                .expect("valid git remote URL"),
+                        )),
                     }),
                     ..Default::default()
                 },
@@ -1596,7 +1626,10 @@ mod tests {
                     git_info: Some(GitInfoPatch {
                         sha: Some(Some("abc123".to_string())),
                         branch: Some(Some("main".to_string())),
-                        origin_url: Some(Some("https://github.com/openai/codex".to_string())),
+                        origin_url: Some(Some(
+                            SanitizedGitUrl::try_from("https://github.com/openai/codex")
+                                .expect("valid git remote URL"),
+                        )),
                     }),
                     ..Default::default()
                 },

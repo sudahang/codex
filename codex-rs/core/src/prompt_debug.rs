@@ -62,6 +62,7 @@ pub async fn build_prompt_input(
         extensions,
         user_instructions_provider,
         /*analytics_events_client*/ None,
+        crate::thread_manager::passthrough_image_store(),
         thread_store,
         crate::local_agent_graph_store_from_state_db(state_db.as_ref()),
         installation_id,
@@ -101,7 +102,7 @@ pub(crate) async fn build_prompt_input_from_session(
     let prompt_input = sess
         .clone_history()
         .await
-        .for_prompt(&step_context.model_info.input_modalities);
+        .for_prompt(&step_context.settings.model_info.input_modalities);
     let base_instructions = sess.get_base_instructions().await;
     let prompt = build_prompt(prompt_input, step_context.as_ref(), base_instructions);
 
